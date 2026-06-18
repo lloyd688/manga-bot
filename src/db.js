@@ -19,6 +19,18 @@ function getDb() {
   return _db;
 }
 
+// ── Bangkok time helpers ──────────────────────────────────────────────────────
+
+const BKK_OFFSET = 7 * 3600 * 1000;
+
+function _bkkNow() { return new Date(Date.now() + BKK_OFFSET); }
+
+// Bangkok ISO datetime string (no 'Z') — used for storing timestamps
+function _bkkNowISO() { return _bkkNow().toISOString().slice(0, 19); }
+
+// Bangkok date string YYYY-MM-DD — used for daily queries
+function _bkkTodayStr() { return _bkkNow().toISOString().slice(0, 10); }
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 function init() {
@@ -57,6 +69,7 @@ function init() {
       status             TEXT DEFAULT 'in_progress',
       claimed_at         TEXT,
       completed_at       TEXT,
+      completed_date     TEXT,
       translated_file_id TEXT,
       translated_type    TEXT
     );
@@ -93,14 +106,30 @@ function init() {
       user_action TEXT
     );
   `);
-  // migrations
+
+  // ── schema migrations ───────────────────────────────────────────────────────
   for (const [col, def] of [
     ['announcement_msg_id', 'INTEGER'],
-    ['chapter_count', 'INTEGER DEFAULT 1'],
-    ['chapter_claimed', 'INTEGER DEFAULT 0'],
+    ['chapter_count',       'INTEGER DEFAULT 1'],
+    ['chapter_claimed',     'INTEGER DEFAULT 0'],
   ]) {
     try { db.exec(`ALTER TABLE jobs ADD COLUMN ${col} ${def}`); } catch {}
   }
+
+  // Add completed_date to job_claims (Bangkok date YYYY-MM-DD)
+  try { db.exec('ALTER TABLE job_claims ADD COLUMN completed_date TEXT'); } catch {}
+
+  // Backfill completed_date for existing rows that have completed_at in UTC
+  // date(datetime(completed_at, '+7 hours')) converts UTC ISO to Bangkok date
+  db.exec(`
+    UPDATE job_claims
+    SET completed_date = date(datetime(completed_at, '+7 hours'))
+    WHERE completed_date IS NULL AND completed_at IS NOT NULL AND status = 'done'
+  `);
+
+  // Create index for fast date-range queries
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_claims_done ON job_claims(translator_id, completed_date) WHERE status=\'done\''); } catch {}
+
   console.log(`DB ready: ${DB_PATH}`);
 }
 
@@ -137,7 +166,7 @@ function createJob(fileId, fileName, fileType, mangaTitle, episode, senderUserId
     VALUES (?,?,?,?,?,?,?,?,'pending',?,?)
   `);
   const info = stmt.run(jobId, fileId, fileName, fileType, mangaTitle, episode,
-    senderUserId, senderName, new Date().toISOString(), Math.max(1, chapterCount));
+    senderUserId, senderName, _bkkNowISO(), Math.max(1, chapterCount));
   return { jobId, pk: info.lastInsertRowid };
 }
 
@@ -154,7 +183,7 @@ function getAllJobsSummary() {
 }
 
 function getTodayCompletedJobs() {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = _bkkTodayStr();
   return getDb().prepare("SELECT * FROM jobs WHERE status='done' AND completed_at LIKE ?")
     .all(`${today}%`);
 }
@@ -176,7 +205,7 @@ function addClaim(jobId, chapterFrom, chapterTo, chapterCount, translatorId, tra
       translator_id,translator_name,claimed_at)
     VALUES (?,?,?,?,?,?,?)
   `).run(jobId, chapterFrom, chapterTo, chapterCount,
-    translatorId, translatorName, new Date().toISOString());
+    translatorId, translatorName, _bkkNowISO());
 
   db.prepare('UPDATE jobs SET chapter_claimed = chapter_claimed + ? WHERE job_id=?')
     .run(chapterCount, jobId);
@@ -208,19 +237,27 @@ function completeClaim(claimId, translatorId, fileId, fileType) {
   if (claim.status !== 'in_progress') return { ok: false, err: `สถานะ: ${claim.status}` };
   if (claim.translator_id !== translatorId) return { ok: false, err: 'งานนี้ไม่ใช่ของคุณ' };
 
+  const nowISO  = _bkkNowISO();
+  const todayStr = _bkkTodayStr();
+
   db.prepare(`
-    UPDATE job_claims SET status='done', translated_file_id=?, translated_type=?, completed_at=? WHERE id=?
-  `).run(fileId, fileType, new Date().toISOString(), claimId);
+    UPDATE job_claims
+    SET status='done', translated_file_id=?, translated_type=?, completed_at=?, completed_date=?
+    WHERE id=?
+  `).run(fileId, fileType, nowISO, todayStr, claimId);
+
   db.prepare('UPDATE jobs SET translated_file_id=?, translated_type=? WHERE job_id=?')
     .run(fileId, fileType, claim.job_id);
 
   const stillActive = db.prepare(`
     SELECT COUNT(*) AS c FROM job_claims WHERE job_id=? AND status='in_progress'
   `).get(claim.job_id).c;
+
   if (stillActive === 0) {
     db.prepare("UPDATE jobs SET status='done', completed_at=? WHERE job_id=?")
-      .run(new Date().toISOString(), claim.job_id);
+      .run(nowISO, claim.job_id);
   }
+
   const job = db.prepare('SELECT * FROM jobs WHERE job_id=?').get(claim.job_id);
   return { ok: true, job };
 }
@@ -270,8 +307,9 @@ function getUserDoneClaims(userId) {
 function resetDoneClaims(userId) {
   const db = getDb();
   const info = db.prepare(`
-    UPDATE job_claims SET status='in_progress', completed_at=NULL,
-      translated_file_id=NULL, translated_type=NULL
+    UPDATE job_claims
+    SET status='in_progress', completed_at=NULL, completed_date=NULL,
+        translated_file_id=NULL, translated_type=NULL
     WHERE translator_id=? AND status='done'
   `).run(userId);
   if (info.changes > 0) {
@@ -309,14 +347,16 @@ function getAllActiveClaims() {
 
 function forceCompleteAllClaims() {
   const db = getDb();
-  const now = new Date().toISOString();
-  const info = db.prepare("UPDATE job_claims SET status='done', completed_at=? WHERE status='in_progress'")
-    .run(now);
+  const nowISO   = _bkkNowISO();
+  const todayStr = _bkkTodayStr();
+  const info = db.prepare(`
+    UPDATE job_claims SET status='done', completed_at=?, completed_date=? WHERE status='in_progress'
+  `).run(nowISO, todayStr);
   db.prepare(`
     UPDATE jobs SET status='done', completed_at=?
     WHERE status IN ('in_progress','partial')
     AND (SELECT COUNT(*) FROM job_claims WHERE job_claims.job_id = jobs.job_id AND job_claims.status='in_progress') = 0
-  `).run(now);
+  `).run(nowISO);
   return info.changes;
 }
 
@@ -347,22 +387,26 @@ function getAllTranslatorSettings() {
   return getDb().prepare('SELECT * FROM translator_settings ORDER BY translator_name').all();
 }
 
-// ── Chapters stats ────────────────────────────────────────────────────────────
+// ── Chapter stats ─────────────────────────────────────────────────────────────
+// Both functions now use the completed_date column (Bangkok date YYYY-MM-DD)
+// which is set explicitly when a claim is completed — no timezone ambiguity.
 
 function getCompletedChaptersOnDate(userId, dateStr) {
   const row = getDb().prepare(`
-    SELECT COALESCE(SUM(chapter_count), 0) AS total FROM job_claims
-    WHERE translator_id=? AND status='done' AND date(completed_at) = ?
+    SELECT COALESCE(SUM(chapter_count), 0) AS total
+    FROM job_claims
+    WHERE translator_id=? AND status='done' AND completed_date = ?
   `).get(userId, dateStr);
   return row ? row.total : 0;
 }
 
 function getCompletedChaptersInMonth(userId, year, month) {
+  const prefix = `${String(year)}-${String(month).padStart(2, '0')}`;
   const row = getDb().prepare(`
-    SELECT COALESCE(SUM(chapter_count), 0) AS total FROM job_claims
-    WHERE translator_id=? AND status='done'
-      AND strftime('%Y', completed_at) = ? AND strftime('%m', completed_at) = ?
-  `).get(userId, String(year), String(month).padStart(2, '0'));
+    SELECT COALESCE(SUM(chapter_count), 0) AS total
+    FROM job_claims
+    WHERE translator_id=? AND status='done' AND completed_date LIKE ?
+  `).get(userId, `${prefix}%`);
   return row ? row.total : 0;
 }
 
@@ -379,9 +423,10 @@ function addManualChapters(userId, translatorName, chapterCount, dateStr) {
   `).run(jobId, completedAt, chapterCount);
   db.prepare(`
     INSERT INTO job_claims (job_id,chapter_from,chapter_to,chapter_count,
-      translator_id,translator_name,status,claimed_at,completed_at)
-    VALUES (?,1,?,?,?,?,'done',?,?)
-  `).run(jobId, chapterCount, chapterCount, userId, translatorName, completedAt, completedAt);
+      translator_id,translator_name,status,claimed_at,completed_at,completed_date)
+    VALUES (?,1,?,?,?,?,'done',?,?,?)
+  `).run(jobId, chapterCount, chapterCount, userId, translatorName,
+    completedAt, completedAt, dateStr);
 }
 
 // ── Attendance ────────────────────────────────────────────────────────────────
@@ -400,6 +445,8 @@ function checkout(userId, workDate, timestamp) {
   const row = db.prepare('SELECT check_in_at FROM attendance WHERE user_id=? AND work_date=?')
     .get(userId, workDate);
   if (!row || !row.check_in_at) return null;
+  // Both timestamps are Bangkok ISO strings (no Z). Subtraction gives correct elapsed hours
+  // because both are offset from UTC by the same 7h constant.
   const msElapsed = new Date(timestamp) - new Date(row.check_in_at);
   const hours = Math.round((msElapsed / 3600000) * 100) / 100;
   db.prepare('UPDATE attendance SET check_out_at=?, hours_worked=? WHERE user_id=? AND work_date=?')
@@ -440,7 +487,7 @@ function logError(errorType, message, traceback = null, userId = null, userActio
   db.prepare(`
     INSERT INTO error_log (logged_at, error_type, message, traceback, user_id, user_action)
     VALUES (?, ?, ?, ?, ?, ?)
-  `).run(new Date().toISOString(), errorType, message, traceback, userId, userAction);
+  `).run(_bkkNowISO(), errorType, message, traceback, userId, userAction);
   db.prepare('DELETE FROM error_log WHERE id NOT IN (SELECT id FROM error_log ORDER BY id DESC LIMIT 20)').run();
 }
 

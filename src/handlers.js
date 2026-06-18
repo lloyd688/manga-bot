@@ -120,12 +120,15 @@ function _parseCaption(caption, filename) {
 
 function _countFromChapterStr(s) {
   s = (s || '').trim();
-  let m = s.match(/^(\d+)\s*[-–]\s*(\d+)$/);
-  if (m) return Math.max(1, parseInt(m[2]) - parseInt(m[1]) + 1);
-  m = s.match(/^(\d+)\s*ตอน/);
+  // "10 ตอน" / "10ตอน" — explicit count prefix
+  let m = s.match(/^(\d+)\s*ตอน/);
   if (m) return Math.max(1, parseInt(m[1]));
-  m = s.match(/^ep\.?\s*(\d+)\s*[-–]\s*(\d+)$/i);
+  // Strip Thai/English chapter label prefixes before parsing range
+  s = s.replace(/^(?:ตอนที่|ตอน|chapter|ch\.?|ep\.?)\s*/i, '').trim();
+  // "1-12" / "1–12"
+  m = s.match(/^(\d+)\s*[-–]\s*(\d+)$/);
   if (m) return Math.max(1, parseInt(m[2]) - parseInt(m[1]) + 1);
+  // "1 to 12"
   m = s.match(/^(\d+)\s+to\s+(\d+)$/i);
   if (m) return Math.max(1, parseInt(m[2]) - parseInt(m[1]) + 1);
   return 1;
